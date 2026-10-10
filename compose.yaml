@@ -1,0 +1,14 @@
+services:
+  scout:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3001
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - scout-data:/app/data
+volumes:
+  scout-data:

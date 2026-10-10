@@ -1,0 +1,38 @@
+import assert from 'node:assert/strict';
+import { parse } from 'dotenv';
+import { readFileSync, mkdirSync } from 'node:fs';
+import { randomBytes, createHash } from 'node:crypto';
+import pg from 'pg';
+import { chromium } from '@playwright/test';
+const base = 'https://scout-sales-agent.vercel.app';
+const remote = parse(readFileSync('.env.vercel.production'));
+const pool = new pg.Pool({ connectionString: remote.DATABASE_URL });
+const token = randomBytes(32).toString('hex');
+const hash = createHash('sha256').update(token).digest('hex');
+let browser;
+try {
+  const auth = await fetch(base + '/api/auth/status');
+  assert.equal(auth.status, 200, 'auth endpoint should work');
+  assert.deepEqual(await auth.json(), { setup: false, authenticated: false });
+  assert.equal((await fetch(base + '/api/state')).status, 401);
+  assert.equal((await fetch(base + '/api/cron')).status, 401);
+  await pool.query('INSERT INTO sessions(token,expires) VALUES($1,$2)', [hash, Date.now() + 300000]);
+  const response = await fetch(base + '/api/state', { headers: { Cookie: `scout_session=${token}` } });
+  assert.equal(response.status, 200);
+  const state = await response.json();
+  assert.equal(state.leads.length, 300); assert.equal(state.senders.length, 2);
+  assert(state.campaigns.every(c => c.status === 'draft'));
+  assert(state.messages.every(m => m.status === 'draft'));
+  assert(!JSON.stringify(state).includes('password_hash')); assert(state.senders.every(s => !('secret' in s)));
+  browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
+  await context.addCookies([{ name: 'scout_session', value: token, url: base, httpOnly: true, secure: true, sameSite: 'Strict' }]);
+  const page = await context.newPage(); const errors = []; page.on('pageerror', e => errors.push(e.message));
+  await page.goto(base); await page.getByRole('heading', { name: 'A clearer path to your next client.' }).waitFor();
+  await page.locator('nav').getByRole('button', { name: 'Prospects', exact: true }).click();
+  await page.getByRole('button', { name: 'Add prospect', exact: true }).waitFor();
+  mkdirSync('test-results', { recursive: true });
+  await page.screenshot({ path: 'test-results/production.png', fullPage: true });
+  assert.deepEqual(errors, []);
+  console.log('Production checks passed: auth enforced, setup closed, cron protected, 300 leads and two senders loaded, draft campaign retained, dashboard rendered without errors.');
+} finally { await browser?.close(); await pool.query('DELETE FROM sessions WHERE token=$1', [hash]); await pool.end(); }
