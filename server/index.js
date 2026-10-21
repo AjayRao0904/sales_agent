@@ -9,7 +9,7 @@ import { all, one, run, now, id, setting, setSetting, encrypt, hashPassword, ver
 import { resolveLocation, webUrl } from './network.js';
 import { saveBusiness, validEmail } from './research.js';
 import { localClock, verifySender, suppress } from './mail.js';
-import { startWorker, draftCase, tick } from './worker.js';
+import { startWorker, draftCase, tick, dataOnly } from './worker.js';
 if (!process.env.VERCEL) await bootstrap();
 export const app = express();
 app.disable('x-powered-by');
@@ -95,6 +95,10 @@ app.post('/api/auth/login', async (req, res) => {
 app.use('/api', async (req, res, next) => (await authenticated(req)) ? next() : res.status(401).json({
   error: 'Sign in to your workspace.'
 }));
+const outreachRoute = /^\/api\/(senders|messages)(\/|$)|^\/api\/leads\/[^/]+\/draft$|^\/api\/campaigns\/[^/]+\/status$/;
+app.use((req, res, next) => dataOnly() && req.method !== 'GET' && outreachRoute.test(req.path) ? res.status(403).json({
+  error: 'Email outreach is turned off in this workspace.'
+}) : next());
 app.post('/api/auth/logout', async (req, res) => {
   await run('DELETE FROM sessions WHERE token=?', tokenHash(cookieToken(req)));
   res.clearCookie('scout_session');
@@ -122,13 +126,14 @@ app.get('/api/state', async (req, res) => {
   if (process.env.VERCEL && process.env.DISABLE_WORKER !== '1') waitUntil(tick());
   const day = (await localClock()).day;
   res.json({
+    data_only: dataOnly(),
     settings: await publicSettings(),
     senders: await publicSenders(),
     campaigns: (await all('SELECT * FROM campaigns ORDER BY created_at DESC')).map(c => ({
       ...c,
       categories: JSON.parse(c.categories)
     })),
-    leads: (await all('SELECT cs.*,b.name,b.category,b.address,b.website,b.email,b.phone,b.maps_url,b.source_url,b.research_status,b.suppressed,b.research,ca.name AS campaign_name FROM cases cs JOIN businesses b ON b.id=cs.business_id JOIN campaigns ca ON ca.id=cs.campaign_id ORDER BY cs.created_at DESC')).map(l => ({
+    leads: (await all('SELECT cs.*,b.name,b.category,b.address,b.website,b.email,b.phone,b.maps_url,b.source_url,b.research_status,b.suppressed,b.research,b.website_status,b.website_checked_at,ca.name AS campaign_name FROM cases cs JOIN businesses b ON b.id=cs.business_id JOIN campaigns ca ON ca.id=cs.campaign_id ORDER BY cs.created_at DESC')).map(l => ({
       ...l,
       research: l.research ? JSON.parse(l.research) : null
     })),
@@ -265,6 +270,15 @@ app.post('/api/campaigns/:id/discover', async (req, res) => {
     })
   });
 });
+app.post('/api/campaigns/:id/check-websites', async (req, res) => {
+  const c = await one('SELECT id FROM campaigns WHERE id=?', req.params.id);
+  if (!c) return res.sendStatus(404);
+  res.json({
+    jobId: await job('website', {
+      campaignId: c.id
+    })
+  });
+});
 app.post('/api/leads', async (req, res) => {
   const b = z.object({
     campaign_id: z.string(),
@@ -282,6 +296,26 @@ app.post('/api/leads', async (req, res) => {
   const saved = await saveBusiness(b.campaign_id, b);
   await queueResearch(saved.businessId);
   res.json(saved);
+});
+// Leading =, +, - or @ would run as a formula when the CSV is opened in a spreadsheet.
+const csvCell = value => {
+  const text = String(value ?? '').replace(/^[=+\-@\t\r]/, "'$&");
+  return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+};
+export function leadsCsv(leads) {
+  const columns = [['Business', l => l.name], ['Category', l => l.category.replaceAll('_', ' ')], ['Address', l => l.address], ['Website', l => l.website], ['Website status', l => l.website_status], ['Email', l => l.email], ['Phone', l => l.phone], ['Maps listing', l => l.maps_url || l.source_url], ['Campaign', l => l.campaign_name], ['Stage', l => l.stage], ['Research status', l => l.research_status], ['Summary', l => l.research?.summary], ['Website mentions', l => l.research?.observations?.map(o => o.detail).join(' | ')], ['Other emails found', l => l.research?.emails?.map(e => e.value).join(' | ')], ['Other phones found', l => l.research?.phones?.map(p => p.value).join(' | ')], ['Sources', l => l.research?.sources?.map(s => s.url).join(' | ')], ['Research gaps', l => l.research?.gaps?.join(' | ')], ['Do not contact', l => l.suppressed ? 'yes' : '']];
+  return [columns.map(c => c[0]), ...leads.map(l => columns.map(c => c[1](l)))].map(row => row.map(csvCell).join(',')).join('\r\n') + '\r\n';
+}
+app.get('/api/leads/export.csv', async (req, res) => {
+  const campaign = typeof req.query.campaign === 'string' ? req.query.campaign : '';
+  const leads = (await all(`SELECT cs.stage,b.name,b.category,b.address,b.website,b.email,b.phone,b.maps_url,b.source_url,b.research_status,b.suppressed,b.research,b.website_status,ca.name AS campaign_name FROM cases cs JOIN businesses b ON b.id=cs.business_id JOIN campaigns ca ON ca.id=cs.campaign_id${campaign ? ' WHERE cs.campaign_id=?' : ''} ORDER BY cs.created_at DESC`, ...(campaign ? [campaign] : []))).map(l => ({
+    ...l,
+    research: l.research ? JSON.parse(l.research) : null
+  }));
+  res.set({
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': `attachment; filename="scout-prospects-${new Date().toISOString().slice(0, 10)}.csv"`
+  }).send('\ufeff' + leadsCsv(leads));
 });
 app.get('/api/leads/:id/activity', async (req, res) => res.json(await all('SELECT * FROM activities WHERE case_id=? ORDER BY created_at DESC', req.params.id)));
 app.put('/api/leads/:id', async (req, res) => {
@@ -320,6 +354,15 @@ app.post('/api/leads/:id/research', async (req, res) => {
   if (!lead) return res.sendStatus(404);
   res.json({
     jobId: await queueResearch(lead.business_id, true)
+  });
+});
+app.post('/api/leads/:id/website', async (req, res) => {
+  const lead = await one('SELECT * FROM cases WHERE id=?', req.params.id);
+  if (!lead) return res.sendStatus(404);
+  res.json({
+    jobId: await job('website', {
+      businessId: lead.business_id
+    })
   });
 });
 app.post('/api/leads/:id/draft', async (req, res) => res.json({

@@ -1,6 +1,8 @@
 import { all, one, run, job, now, id, activity, setting, queueResearch, transaction, bootstrap, setSetting } from './db.js';
-import { discover, researchBusiness, buildDraft } from './research.js';
+import { discover, researchBusiness, buildDraft, checkBusinessWebsite, scanCampaignWebsites } from './research.js';
 import { sendNext, syncInbox } from './mail.js';
+// DATA_ONLY=1 deploys Scout as a research tool: discover and scrape, never draft or send.
+export const dataOnly = () => process.env.DATA_ONLY === '1';
 export async function draftCase(caseId) {
   return transaction(async () => {
     const lead = await one('SELECT b.*,cs.id AS case_id,cs.campaign_id FROM cases cs JOIN businesses b ON b.id=cs.business_id WHERE cs.id=?', caseId);
@@ -34,7 +36,7 @@ export async function tick() {
   }
   try {
     await bootstrap();
-    await sendNext();
+    if (!dataOnly()) await sendNext();
     const task = await one("SELECT * FROM jobs WHERE status='queued' ORDER BY COALESCE(json_extract(payload,'$.priority'),0) DESC,created_at LIMIT 1");
     if (task) {
       let continuation = false;
@@ -69,7 +71,7 @@ export async function tick() {
           for (const c of await all('SELECT id,business_id FROM cases WHERE campaign_id=?', campaign.id)) await queueResearch(c.business_id);
         } else if (task.type === 'research') {
           result = await researchBusiness(payload.businessId);
-          for (const c of await all('SELECT cs.id,ca.status,ca.auto_queue FROM cases cs JOIN campaigns ca ON ca.id=cs.campaign_id WHERE cs.business_id=?', payload.businessId)) {
+          if (!dataOnly()) for (const c of await all('SELECT cs.id,ca.status,ca.auto_queue FROM cases cs JOIN campaigns ca ON ca.id=cs.campaign_id WHERE cs.business_id=?', payload.businessId)) {
             try {
               const messageId = await draftCase(c.id);
               if (c.status === 'active' && c.auto_queue) await run("UPDATE messages SET status='queued' WHERE id=? AND status='draft'", messageId);
@@ -77,6 +79,12 @@ export async function tick() {
               await activity(c.id, 'attention', e.message);
             }
           }
+        } else if (task.type === 'website') {
+          if (payload.businessId) result = await checkBusinessWebsite(payload.businessId);
+          else if (payload.campaignId) result = await scanCampaignWebsites(payload.campaignId, {
+            onProgress: async progress => await run('UPDATE jobs SET result=?,updated_at=? WHERE id=?', JSON.stringify(progress).slice(0, 10000), now(), task.id)
+          });
+          else throw new Error('Website check needs a business or campaign.');
         } else if (task.type === 'inbox') {
           const sender = await one('SELECT * FROM senders WHERE id=?', payload.senderId);
           if (!sender) throw new Error('Sender not found.');
@@ -88,7 +96,7 @@ export async function tick() {
         await run("UPDATE jobs SET status='failed',result=?,updated_at=? WHERE id=?", e.message, now(), task.id);
       }
     }
-    if (Date.now() - Number(await setting('last_inbox_queue', '0')) > 300000) {
+    if (!dataOnly() && Date.now() - Number(await setting('last_inbox_queue', '0')) > 300000) {
       await setSetting('last_inbox_queue', Date.now());
       if ((await setting('auto_sync', '0')) === '1') for (const s of await all("SELECT id FROM senders WHERE verified=1 AND imap_host<>''")) await job('inbox', {
         senderId: s.id

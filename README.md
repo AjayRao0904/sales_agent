@@ -59,6 +59,10 @@ When a listing lacks a website, research first searches the public web for candi
 
 Drafting currently uses **evidence-based templates**, with category-specific website suggestions and supported website observations such as catering or appointments. It does not require or call an LLM API. An LLM provider can be added later for richer research synthesis; no model key is configured. Features remain suggestions subject to the campaign's exact service scope.
 
+## Research-only mode
+
+Set `DATA_ONLY=1` (in `.env`, or as a Vercel environment variable) to run Scout without any email features. It still discovers businesses, checks their websites, and scrapes public contacts and website content. It never drafts, queues, sends, or syncs email: the Outreach and Inbox pages and sender settings are hidden, and those API routes return 403. Use **Prospects → Export CSV** to download each business with its website, website status, email, phone, listing, summary, website mentions, and source URLs. The export respects the selected campaign.
+
 ## Inbox limitations
 
 The Gmail IMAP connection uses the configured app password. Manual sync and optional five-minute sync inspect the latest 100 messages received within 30 days. Only messages matching an existing prospect conversation are stored. Message headers are preferred; email-address matching is used only when it identifies a single case. This is not a full mailbox client or a complete historical inbox import.

@@ -3,7 +3,7 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID, randomBytes, createCipheriv, createDecipheriv, scryptSync, timingSafeEqual } from 'node:crypto';
 import pg from 'pg';
-import { schema, runtimeSchema, mailboxIdentityMigration } from './schema.js';
+import { schema, runtimeSchema, mailboxIdentityMigration, websiteStatusMigration } from './schema.js';
 export const postgres = !!process.env.DATABASE_URL;
 const context = new AsyncLocalStorage();
 let sqlite;
@@ -41,10 +41,14 @@ if (postgres) {
       sqlite.exec(schema); sqlite.exec('COMMIT');
     } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
   }
+  // SQLite cannot add a column conditionally, so guard each ALTER against the live table shape.
+  const businessColumns = sqlite.prepare('PRAGMA table_info(businesses)').all().map(column => column.name);
+  if (!businessColumns.includes('website_status')) sqlite.exec("ALTER TABLE businesses ADD COLUMN website_status TEXT NOT NULL DEFAULT ''");
+  if (!businessColumns.includes('website_checked_at')) sqlite.exec('ALTER TABLE businesses ADD COLUMN website_checked_at TEXT');
 }
 // Schema changes are applied explicitly before deployment, not on every cold start.
 export async function initializeSchema() {
-  if (pool) await pool.query(schema.replace(/expires INTEGER/g, 'expires BIGINT').replace(/\bREAL\b/g, 'DOUBLE PRECISION') + runtimeSchema + mailboxIdentityMigration);
+  if (pool) await pool.query(schema.replace(/expires INTEGER/g, 'expires BIGINT').replace(/\bREAL\b/g, 'DOUBLE PRECISION') + runtimeSchema + mailboxIdentityMigration + websiteStatusMigration);
 }
 export function postgresSql(sql) {
   const ignore = /INSERT OR IGNORE/i.test(sql);

@@ -34,7 +34,9 @@ const {
   extractPage,
   buildDraft,
   saveBusiness,
-  discover
+  discover,
+  checkBusinessWebsite,
+  scanCampaignWebsites
 } = await import('../server/research.js');
 const {
   publicAddress,
@@ -42,7 +44,8 @@ const {
   webUrl
 } = await import('../server/network.js');
 const {
-  app
+  app,
+  leadsCsv
 } = await import('../server/index.js');
 const monday = new Date('2026-10-05T05:00:00Z');
 beforeEach(async () => {
@@ -479,6 +482,73 @@ test('outgoing copies do not hide incoming mail with the same RFC Message-ID', a
   assert.equal(await hasImportedMessage('receiver', messageId), true);
   assert.equal(await hasImportedMessage('sender', messageId), false);
   await assert.rejects(run('INSERT INTO messages(id,case_id,sender_id,recipient,subject,body,direction,message_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)', 'duplicate-in', l.caseId, 'receiver', 'sender@example.com', 'Test', 'Body', 'inbound', messageId, now()));
+});
+test('a reachable homepage marks a prospect website as live and logs the check', async () => {
+  const l = await saveBusiness('campaign', { provider_id: 'web:live', name: 'Live Cafe', category: 'cafe', website: 'https://livecafe.example' });
+  const result = await checkBusinessWebsite(l.businessId, { check: async () => ({ status: 200, url: 'https://livecafe.example/' }) });
+  assert.equal(result.status, 'live');
+  assert.equal((await one('SELECT website_status FROM businesses WHERE id=?', l.businessId)).website_status, 'live');
+  assert.equal((await one("SELECT count(*) n FROM activities WHERE type='website' AND case_id=?", l.caseId)).n, 1);
+});
+test('a 404 homepage marks the website as not working', async () => {
+  const l = await saveBusiness('campaign', { provider_id: 'web:dead', name: 'Gone Cafe', category: 'cafe', website: 'https://gone.example' });
+  assert.equal((await checkBusinessWebsite(l.businessId, { check: async () => ({ status: 404 }) })).status, 'dead');
+});
+test('a bot-protected homepage still counts as a live website', async () => {
+  const l = await saveBusiness('campaign', { provider_id: 'web:403', name: 'Guarded Cafe', category: 'cafe', website: 'https://guarded.example' });
+  assert.equal((await checkBusinessWebsite(l.businessId, { check: async () => ({ status: 403 }) })).status, 'live');
+});
+test('an unreachable host marks the website as not working', async () => {
+  const l = await saveBusiness('campaign', { provider_id: 'web:err', name: 'No DNS Cafe', category: 'cafe', website: 'https://nodns.example' });
+  assert.equal((await checkBusinessWebsite(l.businessId, { check: async () => { throw new Error('getaddrinfo ENOTFOUND'); } })).status, 'dead');
+});
+test('a prospect with no website on file reads as none without probing', async () => {
+  const l = await saveBusiness('campaign', { provider_id: 'web:none', name: 'Offline Cafe', category: 'cafe' });
+  const result = await checkBusinessWebsite(l.businessId, { check: async () => { throw new Error('probe should not run'); } });
+  assert.equal(result.status, 'none');
+  assert.equal((await one('SELECT website_status FROM businesses WHERE id=?', l.businessId)).website_status, 'none');
+});
+test('a campaign website scan tallies live, not working, and missing sites', async () => {
+  await saveBusiness('campaign', { provider_id: 'scan:1', name: 'Has Live Site', category: 'cafe', website: 'https://a.example' });
+  await saveBusiness('campaign', { provider_id: 'scan:2', name: 'Server Down', category: 'cafe', website: 'https://b.example' });
+  await saveBusiness('campaign', { provider_id: 'scan:3', name: 'No Site', category: 'cafe' });
+  const check = async url => url.includes('a.example') ? { status: 200 } : { status: 500 };
+  const result = await scanCampaignWebsites('campaign', { check });
+  assert.equal(result.total, 3);
+  assert.equal(result.live, 1);
+  assert.equal(result.dead, 1);
+  assert.equal(result.none, 1);
+});
+test('prospect CSV quotes commas and neutralises spreadsheet formulas', () => {
+  const csv = leadsCsv([{ name: '=HYPERLINK("x")', category: 'fast_food', address: '1 Main St, Bengaluru', website: 'https://a.example', email: 'hi@a.example', phone: '+91 80 1234', research: { summary: 'A cafe.', observations: [{ detail: 'online ordering' }, { detail: 'catering' }], sources: [{ url: 'https://a.example' }] } }]);
+  const [header, row] = csv.trim().split('\r\n');
+  assert(header.startsWith('Business,Category,Address,Website'));
+  assert(row.startsWith(`"'=HYPERLINK(""x"")",fast food,"1 Main St, Bengaluru",https://a.example`));
+  assert(row.includes("'+91 80 1234"));
+  assert(row.includes('online ordering | catering'));
+});
+test('data-only mode exports prospects and refuses drafting and sending', async () => {
+  process.env.DATA_ONLY = '1';
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise(r => server.once('listening', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const l = await lead(1);
+    let r = await fetch(base + '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'testing-password-123' }) });
+    const cookie = r.headers.get('set-cookie').split(';')[0];
+    const post = path => fetch(base + path, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: '{}' });
+    assert.equal((await (await fetch(base + '/api/state', { headers: { Cookie: cookie } })).json()).data_only, true);
+    for (const path of [`/api/leads/${l.caseId}/draft`, '/api/messages/x/queue', '/api/senders', '/api/campaigns/campaign/status']) assert.equal((await post(path)).status, 403, path);
+    assert.equal((await one('SELECT count(*) n FROM messages')).n, 0);
+    r = await fetch(base + '/api/leads/export.csv?campaign=campaign', { headers: { Cookie: cookie } });
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('content-type'), /text\/csv/);
+    assert((await r.text()).includes('hello1@example.org'));
+    assert.equal((await fetch(base + '/api/leads/export.csv')).status, 401);
+  } finally {
+    delete process.env.DATA_ONLY;
+    server.close();
+  }
 });
 after(async () => {
   await db.close();

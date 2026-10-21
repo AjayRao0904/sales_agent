@@ -2,7 +2,7 @@ import { findBusinessContacts, structuredBusinesses } from './contacts.js';
 import { searchOpenStreetMap } from './discovery.js';
 import * as cheerio from 'cheerio';
 import robotsParser from 'robots-parser';
-import { safeFetch, webUrl } from './network.js';
+import { safeFetch, webUrl, checkUrl } from './network.js';
 import { all, one, run, now, id, activity, setting, decrypt, transaction } from './db.js';
 export const validEmail = value => /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?)+$/i.test(value) && value.length < 255;
 export function extractPage(html, url) {
@@ -338,4 +338,47 @@ export async function discover(campaign, options = {}) {
     warnings,
     summary: `${added} new prospects saved from ${found.length} listings.${warnings.length ? ' Some categories need retrying. ' + warnings.join(' ') : ''}`
   };
+}
+// A server that answers at all has a website; only 404/410/5xx or an unreachable host count as missing.
+const websiteExists = status => (status >= 200 && status < 400) || [401, 403, 429].includes(status);
+export async function checkBusinessWebsite(businessId, { check = checkUrl } = {}) {
+  const b = await one('SELECT * FROM businesses WHERE id=?', businessId);
+  if (!b) throw new Error('Business not found.');
+  let status = 'none';
+  let detail = 'No website on file for this business.';
+  if (b.website) {
+    try {
+      const result = await check(b.website);
+      const reachable = websiteExists(result.status);
+      status = reachable ? 'live' : 'dead';
+      detail = reachable ? `Website responded (HTTP ${result.status}).` : `Website returned HTTP ${result.status}.`;
+    } catch (e) {
+      status = 'dead';
+      detail = e.message;
+    }
+  }
+  const checkedAt = now();
+  await run('UPDATE businesses SET website_status=?,website_checked_at=? WHERE id=?', status, checkedAt, b.id);
+  const note = status === 'live' ? `Website check: live website found. ${detail}` : status === 'dead' ? `Website check: no working website. ${detail}` : 'Website check: no website on file for this business.';
+  for (const c of await all('SELECT id FROM cases WHERE business_id=?', b.id)) await activity(c.id, 'website', note);
+  return { status, detail, checked_at: checkedAt };
+}
+export async function scanCampaignWebsites(campaignId, { onProgress = () => {}, check = checkUrl } = {}) {
+  const businesses = await all('SELECT b.id FROM cases cs JOIN businesses b ON b.id=cs.business_id WHERE cs.campaign_id=?', campaignId);
+  const queue = businesses.map(row => row.id);
+  const total = businesses.length;
+  const tally = { live: 0, dead: 0, none: 0 };
+  let done = 0;
+  const summarize = verb => `${verb} ${done}/${total} website${total === 1 ? '' : 's'} · ${tally.live} live, ${tally.dead} not working, ${tally.none} none on file.`;
+  // Checks run in parallel while database writes serialize in the db layer, so a large campaign finishes well inside the worker lease.
+  const workers = Array.from({ length: Math.min(6, total) }, async () => {
+    while (queue.length) {
+      const businessId = queue.shift();
+      try { tally[(await checkBusinessWebsite(businessId, { check })).status]++; } catch { tally.dead++; }
+      done++;
+      await onProgress({ summary: summarize('Checked'), ...tally, done, total });
+    }
+  });
+  await Promise.all(workers);
+  return { summary: `Checked ${total} website${total === 1 ? '' : 's'} · ${tally.live} live, ${tally.dead} not working, ${tally.none} none on file.`, ...tally, total };
 }

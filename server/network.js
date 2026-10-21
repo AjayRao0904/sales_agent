@@ -22,6 +22,22 @@ export async function safeFetch(value, { redirects = 5, maxBytes = 1500000, sign
     req.on('timeout', () => req.destroy(new Error('Website request timed out.'))); req.on('error', reject);
   });
 }
+// Lightweight reachability probe: confirms a URL responds without downloading the page body.
+export async function checkUrl(value, { redirects = 5, signal = AbortSignal.timeout(10000) } = {}) {
+  const u = webUrl(value); const host = u.hostname.replace(/^\[|\]$/g, '');
+  signal.throwIfAborted();
+  const addresses = await Promise.race([lookup(host, { all: true }), new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('Website request timed out.')), { once: true }))]);
+  if (!addresses.length || addresses.some(x => !publicAddress(x.address))) throw new Error('Private or local network addresses cannot be checked.');
+  const address = addresses[0];
+  return new Promise((resolve, reject) => {
+    const req = (u.protocol === 'https:' ? https : http).get(u, { headers: { 'User-Agent': 'ScoutResearch/1.0 (business website research)', Accept: 'text/html,*/*;q=0.8' }, lookup: (_host, options, cb) => options?.all ? cb(null, [address]) : cb(null, address.address, address.family), timeout: 10000, signal }, res => {
+      const status = res.statusCode; res.resume();
+      if (status >= 300 && status < 400 && res.headers.location) { if (!redirects) return resolve({ status, url: u.href }); return checkUrl(new URL(res.headers.location, u).href, { redirects: redirects - 1, signal }).then(resolve, reject); }
+      resolve({ status, url: u.href });
+    });
+    req.on('timeout', () => req.destroy(new Error('Website request timed out.'))); req.on('error', reject);
+  });
+}
 export function coordinates(input) {
   const patterns = [/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/, /@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/, /(?:[?&](?:q|query|ll)=|^)(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/];
   for (const pattern of patterns) { const match = decodeURIComponent(input).match(pattern); if (match) { const lat = +match[1], lng = +match[2]; if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat, lng }; } }
